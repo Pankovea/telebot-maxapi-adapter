@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telebot_maxapi_adapter"
+version = "0.1.0"
+description = "Connect your AsyncTelebot to MAX messenger"
+license = "GPL-2.0-or-later"
+authors = [
+    {name = "Pankovea", email = "114323250+Pankovea@users.noreply.github.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["max", "maxapi", "telegram", "bot", "api", "tools"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pyTelegramBotAPI>=4.25.0",
+    "maxapi>=1.0.0",
+    "cachetools>=7.0.5"
+    "beautifulsoup4">=4.14.3
+]
+
+[project.urls]
+Homepage = "https://github.com/pankovea/pytelegrambotapi-adapter"
+Repository = "https://github.com/pankovea/pytelegrambotapi-adapter"
+Issues = "https://github.com/pankovea/pytelegrambotapi-adapter/issues"

@@ -1,0 +1,21 @@
+# Сборка и установка Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Кеши и артефакты
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# Тесты и линтеры (опционально, но рекомендуется)
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
