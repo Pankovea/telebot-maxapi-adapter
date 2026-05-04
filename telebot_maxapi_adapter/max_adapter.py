@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import io
+import sqlite3
 import aiohttp
 import inspect
 import logging
@@ -27,11 +28,11 @@ from telebot import types
 from maxapi import Bot as MaxBot, Dispatcher
 
 from maxapi.types.users import User as MaxUser
-from maxapi.types.message import Recipient, LinkedMessage, MessageBody
+from maxapi.types.message import MessageBody
 from maxapi.methods.types.sended_message import SendedMessage
 from maxapi.types.attachments import Attachments
-from maxapi.types.attachments.buttons import InlineButtonUnion
 from maxapi.types.attachments.upload import AttachmentUpload, AttachmentPayload
+from maxapi.types.attachments.buttons.attachment_button import AttachmentButton
 from maxapi.types.input_media import InputMedia, InputMediaBuffer
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 from maxapi.enums.message_link_type import MessageLinkType
@@ -46,7 +47,7 @@ from maxapi.types import (
     Message as MaxMessage,
     
     # Events
-    MessageCreated, MessageEdited, MessageRemoved, MessageCallback,
+    MessageCreated, MessageEdited, MessageCallback,
     BotAdded, BotRemoved,
     BotStarted, BotStopped,
     ChatTitleChanged, UserAdded, UserRemoved,
@@ -60,25 +61,67 @@ from maxapi.types import (
     LinkButton,
     OpenAppButton,
     NewMessageLink,
-    InputMedia,
 )
 ServiceEvents = Union[BotStarted, BotStopped, BotAdded, BotRemoved, ChatTitleChanged, UserAdded, UserRemoved]
 
 
 log = logging.getLogger(__name__)
 
+SEQ_BITS = 64
+SEQ_MASK = (1 << SEQ_BITS) - 1
+MEDIA_GROUP_INDEX_BITS = 4 # Максимально 10 сообщений в группе. Достаточно 4 бита для хранения данных
 
 class MaxAdapter(BaseAdapter):
     """Прозрачный адаптер: бот думает, что работает с Telegram, а на самом деле — MAX"""
 
-    def __init__(self, tg_bot: AsyncTeleBot, max_token: str):
+    def __init__(self, tg_bot: AsyncTeleBot, max_token: str, db_path: Optional[Union[str, Path]] = None):
+        """
+        Инициализирует адаптер Telebot <-> MAX API.
+
+        Args:
+            tg_bot: Экземпляр `AsyncTeleBot`, который получает адаптированные update-события.
+            max_token: Токен бота MAX API.
+            db_path: Опциональный путь к SQLite-файлу для хранения маппинга
+                `user_id -> chat_id`. Если `None`, маппинг хранится только в памяти.
+
+        Raises:
+            ValueError: Если передан невалидный `db_path` или не удалось открыть SQLite.
+
+        Notes:
+            Поднимает runtime-кэши и (опционально) SQLite-хранилище маппинга приватных чатов.
+            Это следствие расхождения API Telegramm и Max.
+            Телеграмм для приватных чатов всегда исаользует chat_id == user_id. У Max это разные id.
+            В базе данных хранятся соответсвия user_id -> chat_id Max.
+        """
         super().__init__(tg_bot)
         self.type = 'max'
         self.max_token = max_token
         self.max_bot = MaxBot(token=max_token)
         self.dp = Dispatcher()
-        # self._user_cache = TTLCache(maxsize=500, ttl=600)  # 10 минут
+        
+        # БД (опционально)
+        self._mapping_db_path: Optional[Path] = None
+        self._mapping_db: Optional[sqlite3.Connection] = None
+        if db_path is not None:
+            try:
+                self._mapping_db_path = Path(db_path).expanduser()
+                self._mapping_db_path.parent.mkdir(parents=True, exist_ok=True)
+                self._mapping_db = sqlite3.connect(self._mapping_db_path)
+                self._mapping_db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_chat_map (
+                        user_id INTEGER PRIMARY KEY,
+                        chat_id INTEGER NOT NULL
+                    )
+                    """
+                )
+                self._mapping_db.commit()
+            except (TypeError, ValueError, OSError, sqlite3.Error) as exc:
+                raise ValueError(f"Invalid db_path: {db_path!r}") from exc
+        
         self._user_to_chat_id: dict[int, int] = dict()
+        if self._mapping_db is not None:
+            self._load_user_chat_mapping()
         self._chat_cache = TTLCache(maxsize=500, ttl=86400)             # 1 сутки
         self._file_info = FileInfoGetter(maxsize=500, ttl=86400)
         self._message_for_edit_cache = TTLCache(maxsize=500, ttl=86400) # 1 сутки (ограничение api на редактирование сообщений ботом)
@@ -173,8 +216,10 @@ class MaxAdapter(BaseAdapter):
         )
 
 
-    async def _convert_chat_id(self, chat_id: int) -> Optional[types.Chat]:
+    async def _convert_chat_id(self, chat_id: Optional[int]) -> Optional[types.Chat]:
         """Преобразует входящее chat_id MAX сообщение в чат telebot.types.Chat"""
+        if not chat_id:
+            return None
         if chat:=self._chat_cache.get(chat_id):
             return chat
         else:
@@ -200,7 +245,7 @@ class MaxAdapter(BaseAdapter):
             if dwu := max_chat.dialog_with_user:
                 # В телеграмм приватный чат с пользователем chat_id = user_id, поэтому заменим данные
                 user_id = dwu.user_id
-                self._user_to_chat_id[user_id] = chat.id
+                self._set_user_chat_mapping(user_id, chat.id)
                 chat.id = user_id
                 chat.first_name = dwu.first_name
                 chat.last_name = dwu.last_name
@@ -345,8 +390,12 @@ class MaxAdapter(BaseAdapter):
     async def _convert_max_message(self, max_msg: MaxMessage, user_locale=..., *, media_group: Literal[False]) -> Message: ...
     @overload
     async def _convert_max_message(self, max_msg: MaxMessage, user_locale=...) -> Message: ...
-    async def _convert_max_message(self, max_msg: MaxMessage, user_locale: Optional[str] = None, *, media_group: bool = False) -> Message | List[Message]:
+    async def _convert_max_message(self, max_msg: MaxMessage, user_locale: Optional[str] = None, *, media_group: bool = False) -> Message | List[Message] | None:
         """MAX Message → Telebot Message"""
+        if not max_msg.body:
+            log.warning(f"У MAX Message отсутвует body. Конвертация не возможна. Возвращено None: {max_msg.model_dump_json()}")
+            return None
+
         self._message_for_edit_cache[max_msg.body.mid] = max_msg
         
         chat = await self._convert_chat_id(max_msg.recipient.chat_id)
@@ -355,7 +404,7 @@ class MaxAdapter(BaseAdapter):
         # минимальные данные
         msg = Message(
             content_type="text",
-            message_id = max_msg.body.mid,
+            message_id = max_msg.body.seq,
             from_user = self._convert_user(max_msg.sender, user_locale),
             date = timestamp,
             chat=chat,
@@ -368,7 +417,7 @@ class MaxAdapter(BaseAdapter):
                 # Ответ на сообщение
                 msg.reply_to_message = Message(
                     content_type="text",
-                    message_id = max_msg.link.message.mid,
+                    message_id = max_msg.link.message.seq,
                     from_user = self._convert_user(max_msg.link.sender, user_locale),
                     date = timestamp,
                     chat=chat,
@@ -379,18 +428,21 @@ class MaxAdapter(BaseAdapter):
 
             elif max_msg.link.type == MessageLinkType.FORWARD:
                 # Пересланное сообщение
-                if max_msg.link.sender:
+                if max_msg.link.sender is not None:
                     # Переслано пользовательское сообщение
+                    converted_user = self._convert_user(max_msg.link.sender, user_locale)
+                    assert converted_user is not None, "_convert_user не должен возвращать None при валидном User"
                     msg.forward_origin = types.MessageOriginUser( # pyright: ignore[reportAttributeAccessIssue]
                         timestamp,
-                        self._convert_user(max_msg.link.sender)
+                        converted_user
                     )
                 else:
                     # Переслано пользовательское сообщение с канала
+                    chat_obj = types.Chat(id=max_msg.link.chat_id, type="channel")
                     msg.forward_origin = types.MessageOriginChannel(
                         timestamp,
-                        max_msg.link.chat_id,
-                        max_msg.link.message.mid
+                        chat_obj,
+                        max_msg.link.message.seq
                     )
                 await self._convertmax_body(max_msg.link.message, msg)
 
@@ -406,7 +458,7 @@ class MaxAdapter(BaseAdapter):
                     for k,v in media:
                         setattr(cp_msg, k, v)
                     # изменяем ID чтобы не пересечься с текущими сообщениями
-                    cp_msg.message_id = f'{cp_msg.message_id}|{i}'
+                    cp_msg.message_id = self._encode_media_group_seq(cp_msg.message_id, i)
                     cp_msg.media_group_id = media_group_id
                     msgs.append(cp_msg)
                 return msgs
@@ -533,21 +585,45 @@ class MaxAdapter(BaseAdapter):
     # ===================================================================
 
     async def _adapt_kwargs(self, kwargs: dict, dest_method: Optional[Callable] = None) -> dict:
-        """Приводим telebot-имена параметров к maxapi"""
+        """
+        Общий метод для приведения аргументов Telebot к параметрам методов MAX API.
+        Для фильтрафии аргументов используйте dest_method.
 
-        chat_id = kwargs.get('chat_id')
-        if chat_id in self._user_to_chat_id:
-            chat_id = self._user_to_chat_id[chat_id]
+        Args:
+            kwargs: Словарь аргументов Telebot (`chat_id`, `message_id`, `text`, вложения).
+            dest_method (optional): Целевой метод MAX API.
+            По его сигнатуре будет произведена фильтрация kwargs.
+
+        Returns:
+            Подготовленные аргументы для вызова методов `max_bot.*`.
+
+        Raises:
+            ValueError: Если `message_id` передан в неподдерживаемом формате.
+
+        Notes:
+            Поддерживает конвертацию Telegram-style `message_id` (аналог `seq`)
+            в `max_message.body.mid`.
+            
+            Реализация поддержки media group:
+            В MAX все вложения находятся в одном сообщении с единственным номером.
+            В Телеграмм для кажкого вложения (например картинки в альбоме) присвоен
+            отдельный номер сообщения.
+            Реализован механизм запаковки номера вложения в message_id методом
+            добавления номера вложения в старшие биты `seq`
+            Соответвенно здесь происходит декодирование message_id
+            в пару group_indx, message_id, если такие биты данных обнаружены.
+        """
+
+        chat_id = self._resolve_max_chat_id(kwargs.get('chat_id'))
         
-        group_indx = None
+        group_indx: Optional[int] = None
         orig_max_msg = None
-        if message_id := kwargs.get('message_id'):
-            if '|' in message_id:
-                message_id, group_indx = message_id.split('|')
-                group_indx = int(group_indx)
-                orig_max_msg = self._message_for_edit_cache.get(message_id)
-            else:
-                orig_max_msg = self._message_for_edit_cache.get(message_id)
+        mid = None
+        message_id = kwargs.get('message_id')
+        if message_id:
+            group_indx, message_id = self._decode_media_group_seq(int(message_id))
+            mid = self.chat_id_and_seq_to_mid(chat_id, message_id)
+            orig_max_msg = self._message_for_edit_cache.get(mid)
 
         disable_link_preview = None
         if kwargs.get('disable_web_page_preview', None):
@@ -560,7 +636,7 @@ class MaxAdapter(BaseAdapter):
 
         # Конвертация параметров
         max_kwargs = {
-            "message_id": message_id,
+            "message_id": mid,
             "chat_id": chat_id,
             "text": kwargs.get('text') or '',
             "format": self._convert_parse_mode(kwargs.get('parse_mode')),
@@ -572,10 +648,16 @@ class MaxAdapter(BaseAdapter):
         
         # Обработка reply_to_message
         if reply_to := kwargs.get('reply_to_message_id'):
-            max_kwargs["link"] = NewMessageLink(type=MessageLinkType.REPLY, mid=reply_to)
+            max_kwargs["link"] = NewMessageLink(
+                type=MessageLinkType.REPLY,
+                mid=self.chat_id_and_seq_to_mid(chat_id, reply_to)
+            )
         elif reply_parameters := kwargs.get('reply_parameters'):
             reply_parameters = cast(types.ReplyParameters, reply_parameters)
-            max_kwargs["link"] = NewMessageLink(type=MessageLinkType.REPLY, mid=str(reply_parameters.message_id))
+            max_kwargs["link"] = NewMessageLink(
+                type=MessageLinkType.REPLY,
+                mid=self.chat_id_and_seq_to_mid(chat_id, reply_parameters.message_id)
+            )
 
         
         # Обработка клавиатуры
@@ -639,7 +721,18 @@ class MaxAdapter(BaseAdapter):
         offset: Optional[int],
         allowed_updates: Optional[List[str]]
     ) -> dict:
-        """Конвертирует аргументы telebot в аргументы maxapi"""
+        """
+        Конвертирует аргументы Telebot `get_updates` в MAX-формат.
+
+        Args: Данные из max_bot.get_updates()
+            limit: Максимум событий в ответе.
+            timeout: Таймаут long polling.
+            offset: Telegram offset (преобразуется в MAX marker).
+            allowed_updates: Разрешённые типы обновлений Telegram.
+
+        Returns:
+            Словарь параметров для `max_bot.get_updates`.
+        """
         kw = {}
         
         if limit is not None:
@@ -672,9 +765,121 @@ class MaxAdapter(BaseAdapter):
 
 
     def _filter_kwargs(self, kwargs: dict, dest_method: Callable):
-        'Очищает kwargs от лишних аргументов'
+        """
+        Очищает словарь аргументов по сигнатуре целевого метода.
+
+        Args:
+            kwargs: Исходный набор аргументов.
+            dest_method: Метод, чья сигнатура используется для фильтрации.
+
+        Returns:
+            Новый словарь только с допустимыми и не-`None` аргументами.
+        """
         arg_names = list(inspect.signature(dest_method).parameters.keys())
         return {k: v for k, v in kwargs.items() if k in arg_names and v is not None}
+
+    def _load_user_chat_mapping(self) -> None:
+        """Загружает маппинг `user_id -> chat_id` из SQLite в память."""
+        if self._mapping_db is None:
+            return
+        cursor = self._mapping_db.execute("SELECT user_id, chat_id FROM user_chat_map")
+        self._user_to_chat_id = {int(user_id): int(chat_id) for user_id, chat_id in cursor.fetchall()}
+
+    def _set_user_chat_mapping(self, user_id: int, chat_id: int) -> None:
+        """
+        Сохраняет соответствие пользователя и приватного чата.
+        Если подключена БД, то сохраняет в неё.
+
+        Args:
+            user_id: Telegram-style id пользователя.
+            chat_id: Фактический id приватного диалога в MAX.
+        """
+        self._user_to_chat_id[user_id] = chat_id
+        if self._mapping_db is None:
+            return
+        self._mapping_db.execute(
+            """
+            INSERT INTO user_chat_map(user_id, chat_id)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id
+            """,
+            (user_id, chat_id),
+        )
+        self._mapping_db.commit()
+
+    def _resolve_max_chat_id(self, chat_id: Any) -> Any:
+        """
+        Определяет `chat_id` через persisted-маппинг приватных диалогов.
+
+        Args:
+            chat_id: Входной `chat_id` из Telebot-вызова.
+
+        Returns:
+            MAX `chat_id`, если найдено соответствие, иначе исходное значение.
+        """
+        if chat_id in self._user_to_chat_id:
+            return self._user_to_chat_id[chat_id]
+
+        if isinstance(chat_id, int) and self._mapping_db is not None:
+            cursor = self._mapping_db.execute(
+                "SELECT chat_id FROM user_chat_map WHERE user_id = ?",
+                (chat_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                resolved = int(row[0])
+                self._user_to_chat_id[chat_id] = resolved
+                return resolved
+
+        return chat_id
+
+
+    @staticmethod
+    def _encode_media_group_seq(seq: int, group_index: int) -> int:
+        """
+        Кодирует индекс вложения media group в старшие биты `seq`.
+
+        Args:
+            seq: Исходный 64-битный sequence id.
+            group_index: Индекс вложения в альбоме (0..9).
+
+        Returns:
+            Закодированный `seq`, пригодный для внешнего Telegram-like интерфейса.
+
+        Raises:
+            ValueError: Если индекс вложения вне допустимого диапазона.
+        """
+        MEDIA_GROUP_INDEX_MAX = 1 << MEDIA_GROUP_INDEX_BITS - 1
+        if group_index < 0 or group_index >= MEDIA_GROUP_INDEX_MAX:
+            raise ValueError(f"group_index должен быть в диапазоне [0, {MEDIA_GROUP_INDEX_MAX}]")
+        # Храним (index + 1), чтобы даже первый элемент альбома был > 2**64.
+        encoded_index = group_index + 1
+        return (encoded_index << SEQ_BITS) | seq
+
+    @staticmethod
+    def _decode_media_group_seq(encoded_seq: int) -> tuple[Optional[int], int]:
+        """
+        Декодирует packed `seq` media-group в `(index, seq)`.
+
+        Args:
+            encoded_seq: Входной message id в числовом формате.
+
+        Returns:
+            Кортеж `(group_index, seq)`, где `group_index=None` для обычных сообщений.
+        """
+        if encoded_seq <= (1 << SEQ_BITS):
+            return None, encoded_seq
+
+        encoded_index = encoded_seq >> SEQ_BITS
+        seq = encoded_seq & SEQ_MASK
+        if encoded_index == 0:
+            return None, seq
+
+        group_index = encoded_index - 1
+        if group_index < 0 or group_index >= 1 << MEDIA_GROUP_INDEX_BITS:
+            return None, seq
+
+        return group_index, seq
 
 
     def _convert_parse_mode(self, parse_mode: Optional[str]) -> Optional[str]:
@@ -691,7 +896,7 @@ class MaxAdapter(BaseAdapter):
         return mapping.get(parse_mode)
 
 
-    def _convert_keyboard(self, reply_markup: Optional[types.InlineKeyboardMarkup]) -> Attachment:
+    def _convert_keyboard(self, reply_markup: Optional[types.InlineKeyboardMarkup]) -> AttachmentButton:
         """Telebot InlineKeyboardMarkup → Max ButtonsPayload format"""
         kb = InlineKeyboardBuilder()
 
@@ -860,14 +1065,26 @@ class MaxAdapter(BaseAdapter):
     @overload
     async def _send_max_message(self, **max_kwargs) -> Message: ...
     async def _send_max_message(self, *, media_group: bool = False, **max_kwargs) -> Message | List[Message]:
-        '''Отправляет сообщение в MAX c параметрами kwargs
-        Возвращает объект telebot.types.Message'''
+        """
+        Отправляет сообщение в MAX и возвращает результат в формате Telebot.
+
+        Args:
+            **max_kwargs: Подготовленные аргументы вызова MAX API.
+            media_group: Если `True`, возвращается список сообщений альбома.
+
+        Returns:
+            `Message` или `List[Message]` в зависимости от `media_group`.
+
+        Raises:
+            telebot.apihelper.ApiTelegramException: Ошибка MAX API в Telegram-совместимом виде.
+            RuntimeError: Пробрасывается без изменений.
+        """
         try:
             max_result = await self.max_bot.send_message(**max_kwargs)
             max_result = cast(SendedMessage, max_result) # Если без ошибок, то получаем SendedMessage
         except MaxApiError as e:
-            raise self.get_tg_exception(e.code, f'{e.raw.get('code')}: {e.raw.get('message')}')
-        except RuntimeError as e:
+            raise self.get_tg_exception(e.code, f'{e.code}: {e.raw}')
+        except RuntimeError:
             raise
         
         # Конвертация ответа обратно в Telebot Message
@@ -880,7 +1097,16 @@ class MaxAdapter(BaseAdapter):
     # [ ] ИСХОДЯЩИЕ МЕТОДЫ (патчинг telebot → maxapi)
     # ===================================================================
     async def send_message(self, *args, **kwargs) -> Message:
-        """sendMessage: Telebot → Max"""
+        """
+        Аналог `send_message` Telebot поверх MAX API.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            Отправленное сообщение в формате Telebot.
+        """
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         max_kwargs = await self._adapt_kwargs(tg_kwargs)
         tg_message = await self._send_max_message(**max_kwargs)
@@ -888,6 +1114,16 @@ class MaxAdapter(BaseAdapter):
 
 
     async def send_photo(self, *args, **kwargs) -> Message:
+        """
+        Аналог `send_photo` Telebot поверх MAX API.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            Отправленное сообщение в формате Telebot.
+        """
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         max_kwargs = await self._adapt_kwargs(tg_kwargs)
         tg_message = await self._send_max_message(**max_kwargs)
@@ -895,6 +1131,16 @@ class MaxAdapter(BaseAdapter):
 
 
     async def send_document(self, *args, **kwargs) -> Message:
+        """
+        Аналог `send_document` Telebot поверх MAX API.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            Отправленное сообщение в формате Telebot.
+        """
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         max_kwargs = await self._adapt_kwargs(tg_kwargs)
         tg_message = await self._send_max_message(**max_kwargs)
@@ -902,6 +1148,16 @@ class MaxAdapter(BaseAdapter):
 
 
     async def send_media_group(self, *args, **kwargs) -> List[Message]:
+        """
+        Отправляет media group (альбом) через MAX API.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            Список отправленных сообщений в формате Telebot.
+        """
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         max_kwargs = await self._adapt_kwargs(tg_kwargs)
         tg_messages = await self._send_max_message(**max_kwargs, media_group=True)
@@ -909,13 +1165,23 @@ class MaxAdapter(BaseAdapter):
 
 
     async def edit_message_text(self, *args, **kwargs) -> Union[Message, bool]:
+        """
+        Редактирует текст сообщения.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            Изменённый `Message`, `True` (если объект получить не удалось), или `False`.
+        """
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         kw = await self._adapt_kwargs(tg_kwargs)
         result = await self.max_bot.edit_message(**self._filter_kwargs(kw, self.max_bot.edit_message))
         if result and result.success:
             # Max не возвращает изменённое сообщение, но для телеграмм программы оно нужно
             # Поэтому просто запросим это сообщеине через API
-            if message_id := kwargs.get('message_id'):
+            if message_id := kw.get('message_id'):
                 # if orig_max_msg = cast(MaxMessage|None, kw.get('orig_max_msg')):
                 #     orig_max_msg.body.attachments = kw.get('attachments')
                 #     orig_max_msg.body.text = kw.get('text')
@@ -933,11 +1199,21 @@ class MaxAdapter(BaseAdapter):
 
 
     async def edit_message_caption(self, *args, **kwargs) -> Union[Message, bool]:
+        """
+        Редактирует caption у сообщения с вложением.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            Изменённый `Message`, `True` (если объект получить не удалось), или `False`.
+        """
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         kw = await self._adapt_kwargs(tg_kwargs)
         result = await self.max_bot.edit_message(**self._filter_kwargs(kw, self.max_bot.edit_message))
         if result and result.success:
-            if message_id := kwargs.get('message_id'):
+            if message_id := kw.get('message_id'):
                 max_message = await self.max_bot.get_message(message_id)
                 tg_message = await self._convert_max_message(max_message)
                 tg_message.edit_date = int(time())
@@ -949,6 +1225,19 @@ class MaxAdapter(BaseAdapter):
 
 
     async def edit_message_media(self, *args, **kwargs) -> Union[Message, bool]:
+        """
+        Редактирует медиа-вложение сообщения.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            Изменённый `Message` при успехе, иначе `False`.
+
+        Notes:
+            Для media group индекс вложения извлекается из packed `seq`.
+        """
         # Замена картинки в галерее
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         kw = await self._adapt_kwargs(tg_kwargs)
@@ -984,14 +1273,27 @@ class MaxAdapter(BaseAdapter):
 
 
     async def edit_message_reply_markup(self, *args, **kwargs) -> Union[Message, bool]:
+        """
+        Редактирует inline-клавиатуру сообщения.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            Изменённый `Message` при успехе, иначе `False`.
+        """
         # Замена кнопок
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         kw = await self._adapt_kwargs(tg_kwargs)
         orig_max_msg = cast(MaxMessage|None, kw.get('orig_max_msg'))
         reply_markup = kw.get('reply_markup')
         if reply_markup:
-            if orig_max_msg and orig_max_msg.body and (att := orig_max_msg.body.attachments):
-                attachments = [a for a in orig_max_msg.body.attachments if a.type != AttachmentType.INLINE_KEYBOARD]
+            if orig_max_msg and orig_max_msg.body and orig_max_msg.body.attachments:
+                attachments: list[Attachments] = [
+                    a for a in orig_max_msg.body.attachments
+                    if a.type != AttachmentType.INLINE_KEYBOARD
+                ]
                 attachments.append(self._convert_keyboard(reply_markup))
                 kw['attachments'] = attachments
 
@@ -1000,11 +1302,24 @@ class MaxAdapter(BaseAdapter):
                     tg_message = await self._convert_max_message(orig_max_msg)
                     tg_message.edit_date = int(time())
                     return tg_message
+            else:
+                # Необходимо исходное сообщение, чтобы заменить клавиатуру.
+                return False
                 
         return False
 
 
     async def delete_message(self, *args, **kwargs) -> bool:
+        """
+        Удаляет сообщение в чате.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            `True`, если удаление прошло успешно, иначе `False`.
+        """
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         kw = await self._adapt_kwargs(tg_kwargs, self.max_bot.delete_message)
         result = await self.max_bot.delete_message(**kw)
@@ -1012,12 +1327,27 @@ class MaxAdapter(BaseAdapter):
 
 
     async def set_message_reaction(self, *args, **kwargs) -> bool:
-        """В MAX бот не умеет ставить реакции. Просто вернём неудачу"""
+        """
+        Заглушка: в MAX API бот не может ставить реакции.
+
+        Returns:
+            Всегда `False`.
+        """
         log.info(f"[STUB] set_message_reaction chat={kwargs.get('chat_id')}, mid={kwargs.get('message_id')}, reaction={kwargs.get('reaction')}")
         return False
 
 
     async def pin_chat_message(self, *args, **kwargs) -> bool:
+        """
+        Закрепляет сообщение в чате.
+
+        Args:
+            *args: Позиционные аргументы Telebot.
+            **kwargs: Именованные аргументы Telebot.
+
+        Returns:
+            `True`, если закрепление успешно, иначе `False`.
+        """
         tg_kwargs = self.args_to_kwargs(args, kwargs)
         kw = await self._adapt_kwargs(tg_kwargs, self.max_bot.pin_message)
         result = await self.max_bot.pin_message(**kw)
@@ -1025,6 +1355,15 @@ class MaxAdapter(BaseAdapter):
 
 
     async def get_file(self, file_id: str) -> types.File:
+        """
+        Возвращает метаданные файла в формате Telebot.
+
+        Args:
+            file_id: Идентификатор вида `<token>|<url>`.
+
+        Returns:
+            Экземпляр `telebot.types.File`.
+        """
         token, url = file_id.split('|')
         file_info = await self._file_info.get(url)
         return types.File(
@@ -1036,6 +1375,18 @@ class MaxAdapter(BaseAdapter):
 
 
     async def download_file(self, file_path: str) -> bytes:
+        """
+        Скачивает файл по URL.
+
+        Args:
+            file_path: Полный URL файла.
+
+        Returns:
+            Содержимое файла в байтах.
+
+        Raises:
+            aiohttp.ClientResponseError: При неуспешном HTTP-ответе.
+        """
         # Скачивает файл по ссылке
         async with aiohttp.ClientSession() as session:
             async with session.get(file_path) as response:
@@ -1044,25 +1395,55 @@ class MaxAdapter(BaseAdapter):
 
 
     async def create_forum_topic(self, chat_id: int, name: str, **kwargs) -> types.ForumTopic:
+        """
+        Заглушка: MAX API не поддерживает forum topics.
+
+        Raises:
+            telebot.apihelper.ApiTelegramException: Всегда, код 400.
+        """
         log.info(f"[STUB] create_forum_topic chat={chat_id} name={name}")
         # Max не поддерживает топики, поэтому все чаты просто с отключенными темами по умолчанию
         # По сути этот метод не должен быть использован никогда.
         raise self.get_tg_exception(400, "Bad Request: can't create forum topics in a non-forum chat")
 
     async def edit_forum_topic(self, chat_id: int, message_thread_id: int, **kwargs) -> bool:
+        """
+        Заглушка: редактирование топиков не поддерживается.
+
+        Returns:
+            Всегда `False`.
+        """
         log.info(f"[STUB] edit_forum_topic chat={chat_id} thread={message_thread_id}")
         return False
 
     async def close_forum_topic(self, chat_id: int, message_thread_id: int, **kwargs) -> bool:
+        """
+        Заглушка: закрытие топиков не поддерживается.
+
+        Returns:
+            Всегда `False`.
+        """
         log.info(f"[STUB] close_forum_topic chat={chat_id} thread={message_thread_id}")
         return False
 
     async def reopen_forum_topic(self, chat_id: int, message_thread_id: int, **kwargs) -> bool:
+        """
+        Заглушка: переоткрытие топиков не поддерживается.
+
+        Returns:
+            Всегда `False`.
+        """
         log.info(f"[STUB] close_forum_topic chat={chat_id} thread={message_thread_id}")
         return False
 
 
     async def get_me(self) -> types.User:
+        """
+        Возвращает профиль текущего бота.
+
+        Returns:
+            Экземпляр `telebot.types.User`.
+        """
         if not hasattr(self.tg_bot, 'bot_user') or self.tg_bot.bot_user is None: # pyright: ignore[reportAttributeAccessIssue]
             self.tg_bot.bot_user = self._convert_user(await self.max_bot.get_me()) # pyright: ignore[reportAttributeAccessIssue]
         return self.tg_bot.bot_user # pyright: ignore[reportReturnType, reportAttributeAccessIssue]
@@ -1070,7 +1451,19 @@ class MaxAdapter(BaseAdapter):
 
     async def get_updates(self, offset: Optional[int]=None, limit: Optional[int]=None,
         timeout: Optional[int]=20, allowed_updates: Optional[List]=None, request_timeout: Optional[int]=None) -> List[types.Update]:
-        """get_updates"""
+        """
+        Получает update-события из MAX и конвертирует их в Telebot-структуры.
+
+        Args:
+            offset: Telegram-style offset.
+            limit: Максимальное число событий.
+            timeout: Таймаут long-polling.
+            allowed_updates: Разрешённые типы событий.
+            request_timeout: Аргумент для совместимости с Telebot API.
+
+        Returns:
+            Список `telebot.types.Update`.
+        """
         kw = self._convert_update_args(limit, timeout, offset, allowed_updates)
         max_updates_dict = await self.max_bot.get_updates(**kw)
         max_updates = await process_update_request(max_updates_dict, self.max_bot)
@@ -1142,8 +1535,14 @@ class MaxAdapter(BaseAdapter):
     # [ ] ЗАПУСК
     # ===================================================================
     async def infinity_polling(self, *args, **kwargs):
-        """Запуск polling"""
-        log.info('🚀 Запуск MaxAdapter polling...')
+        """
+        Запускает бесконечный polling через MAX Dispatcher.
+
+        Args:
+            *args: Пусто
+            **kwargs: Пусто
+        """
+        log.info('Запуск MaxAdapter polling...')
         await self.dp.start_polling(self.max_bot)
 
     # Если захочешь webhook + FastAPI — добавь отдельный метод

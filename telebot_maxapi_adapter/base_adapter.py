@@ -20,16 +20,16 @@ class CustomMessage(types.Message):
     и делаем просто назначаемые аттрибуты'''
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.message_id: int|str
+        self.message_id: int
         self._html_text: Optional[str] = None
         self._html_caption: Optional[str] = None
         self._json: Optional[str] = args[6] if len(args)>=7 else kwargs.get('json_string')
 
     @property
-    def id(self) -> int|str:
+    def id(self) -> int:
         return self.message_id
     @id.setter
-    def id(self, message_id: int|str):
+    def id(self, message_id: int): # type: ignore
         self.message_id = message_id
 
     @property
@@ -86,7 +86,8 @@ class CustomMessage(types.Message):
 
     def __repr__(self):
         text = (self.text or self.caption)
-        if text: text = text.replace('\n', '¶ ')
+        if text:
+            text = text.replace('\n', '¶ ')
         return f'{self.chat.id}|{self.id} {"private" if self.chat.type == "private" else self.chat.title}|{self.from_user.full_name if self.from_user else ""}: {text}  -  ' + str(self.to_dict())
     
     def __str__(self):
@@ -130,35 +131,35 @@ class BaseAdapter(ABC):
     # ===================================================================
         
     @abstractmethod
-    async def send_message(self, *args, **kwargs) -> types.Message:
+    async def send_message(self, *args, **kwargs) -> Message:
         """sendMessage"""
 
     @abstractmethod
-    async def send_photo(self, *args, **kwargs) -> types.Message:
+    async def send_photo(self, *args, **kwargs) -> Message:
         """sendPhoto"""
 
     @abstractmethod
-    async def send_document(self, *args, **kwargs) -> types.Message:
+    async def send_document(self, *args, **kwargs) -> Message:
         """sendDocument"""
 
     @abstractmethod
-    async def send_media_group(self, *args, **kwargs) -> List[types.Message]:
+    async def send_media_group(self, *args, **kwargs) -> List[Message]:
         """sendMediaGroup"""
 
     @abstractmethod
-    async def edit_message_text(self, *args, **kwargs) -> Union[types.Message, bool]:
+    async def edit_message_text(self, *args, **kwargs) -> Union[Message, bool]:
         """editMessageText"""
 
     @abstractmethod
-    async def edit_message_caption(self, *args, **kwargs) -> Union[types.Message, bool]:
+    async def edit_message_caption(self, *args, **kwargs) -> Union[Message, bool]:
         """editMessageCaption"""
 
     @abstractmethod
-    async def edit_message_media(self, *args, **kwargs) -> Union[types.Message, bool]:
+    async def edit_message_media(self, *args, **kwargs) -> Union[Message, bool]:
         """editMessageMedia"""
 
     @abstractmethod
-    async def edit_message_reply_markup(self, *args, **kwargs) -> Union[types.Message, bool]:
+    async def edit_message_reply_markup(self, *args, **kwargs) -> Union[Message, bool]:
         """editMessageReplyMarkup"""
 
     @abstractmethod
@@ -174,11 +175,11 @@ class BaseAdapter(ABC):
         """pinChatMessage"""
 
     @abstractmethod
-    async def get_file(self, file_id: Optional[str]) -> types.File:
+    async def get_file(self, file_id: str) -> types.File:
         """getFile"""
 
     @abstractmethod
-    async def download_file(self, file_path: Optional[str]) -> bytes:
+    async def download_file(self, file_path: str) -> bytes:
         """downloadFile"""
 
     @abstractmethod
@@ -199,7 +200,7 @@ class BaseAdapter(ABC):
 
 
     @abstractmethod
-    async def get_updates(self) -> types.User:
+    async def get_updates(self) -> list[types.Update]:
         """get_updates"""
 
     # @abstractmethod
@@ -345,7 +346,6 @@ class BaseAdapter(ABC):
     # И запустить в обработку здесь
     # ===================================================================
     @abstractmethod
-    def infinity_polling(self):
+    async def infinity_polling(self,  *args, **kwargs):
         """Запуск бота"""
-
 

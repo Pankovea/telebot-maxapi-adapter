@@ -20,11 +20,27 @@ classifiers = [
 dependencies = [
     "pyTelegramBotAPI>=4.25.0",
     "maxapi>=1.0.0",
-    "cachetools>=7.0.5"
-    "beautifulsoup4">=4.14.3
+    "cachetools>=7.0.5",
+    "beautifulsoup4>=4.14.3"
 ]
 
 [project.urls]
 Homepage = "https://github.com/pankovea/pytelegrambotapi-adapter"
 Repository = "https://github.com/pankovea/pytelegrambotapi-adapter"
 Issues = "https://github.com/pankovea/pytelegrambotapi-adapter/issues"
+
+[tool.ruff]
+src = ["telebot_maxapi_adapter"]
+exclude = []
+indent-width = 4
+target-version = "py310"
+
+[tool.ruff.lint]
+extend-ignore = ["E701"]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = false
+docstring-code-format = true
