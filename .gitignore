@@ -4,6 +4,7 @@ dist/
 *.egg-info/
 *.egg
 .eggs/
+telebot_maxapi_adapter-*/
 
 # Кеши и артефакты
 __pycache__/
