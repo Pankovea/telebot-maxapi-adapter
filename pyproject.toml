@@ -25,9 +25,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pankovea/pytelegrambotapi-adapter"
-Repository = "https://github.com/pankovea/pytelegrambotapi-adapter"
-Issues = "https://github.com/pankovea/pytelegrambotapi-adapter/issues"
+Homepage = "https://github.com/Pankovea/telebot-maxapi-adapter"
+Repository = "https://github.com/Pankovea/telebot-maxapi-adapter"
+Issues = "https://github.com/Pankovea/telebot-maxapi-adapter/issues"
 
 [tool.ruff]
 src = ["telebot_maxapi_adapter"]
